@@ -23,19 +23,20 @@ from bs4 import BeautifulSoup
 # ── Configuration ──────────────────────────────────────────────────────────
 
 BASE_URL = "https://biznes.pap.pl"
-OUTPUT_DIR = "/media/solek/16TB1/espi_periodic"
+OUTPUT_DIR = "/mnt/shared/espi_periodic"
 STATE_DIR = os.path.join(OUTPUT_DIR, "_state")
 LOG_FILE = os.path.join(OUTPUT_DIR, "_state", "scraper.log")
 
 YEARS = range(2026, 2012, -1)  # 2026 down to 2013
-PAGE_DELAY = (2.0, 4.0)        # seconds between report page fetches
-DOWNLOAD_DELAY = (0.5, 1.5)    # seconds between attachment downloads
-LISTING_DELAY = (1.0, 2.0)     # seconds between day listing fetches
-BULK_PAUSE_EVERY = 50           # extra pause every N reports
-BULK_PAUSE_SECS = 10
+PAGE_DELAY = (5.0, 10.0)       # seconds between report page fetches
+DOWNLOAD_DELAY = (1.5, 3.0)    # seconds between attachment downloads
+LISTING_DELAY = (3.0, 6.0)     # seconds between day listing fetches
+BULK_PAUSE_EVERY = 20           # extra pause every N reports
+BULK_PAUSE_SECS = 30
 
 MAX_RETRIES = 3
-BACKOFF_BASE = 30  # seconds for first retry on 429/5xx
+BACKOFF_BASE = 60  # seconds for first retry on 429/5xx
+MAX_CONSECUTIVE_TIMEOUTS = 5  # stop scraper after this many timeouts in a row
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
@@ -118,15 +119,27 @@ def make_session() -> requests.Session:
     return s
 
 
+class SiteBlockedError(Exception):
+    """Raised when the site appears to be blocking us."""
+    pass
+
+
+# Global counter for consecutive timeouts
+_consecutive_timeouts = 0
+
+
 def fetch_with_retry(session: requests.Session, url: str,
                      delay_range: tuple = PAGE_DELAY,
                      stream: bool = False) -> requests.Response | None:
     """Fetch URL with retry + backoff on transient errors."""
+    global _consecutive_timeouts
+
     for attempt in range(MAX_RETRIES):
         try:
             time.sleep(random.uniform(*delay_range))
             resp = session.get(url, timeout=60, stream=stream)
             if resp.status_code == 200:
+                _consecutive_timeouts = 0  # reset on success
                 return resp
             if resp.status_code in (429, 500, 502, 503, 504):
                 wait = BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 5)
@@ -137,6 +150,7 @@ def fetch_with_retry(session: requests.Session, url: str,
                 time.sleep(wait)
                 continue
             logging.error("HTTP %d for %s – skipping", resp.status_code, url)
+            _consecutive_timeouts = 0  # non-timeout error, reset
             return None
         except requests.RequestException as e:
             wait = BACKOFF_BASE * (2 ** attempt)
@@ -145,7 +159,16 @@ def fetch_with_retry(session: requests.Session, url: str,
                 url, e, wait, attempt + 1, MAX_RETRIES,
             )
             time.sleep(wait)
-    logging.error("All retries exhausted for %s", url)
+
+    _consecutive_timeouts += 1
+    logging.error("All retries exhausted for %s (consecutive timeouts: %d/%d)",
+                  url, _consecutive_timeouts, MAX_CONSECUTIVE_TIMEOUTS)
+
+    if _consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
+        raise SiteBlockedError(
+            f"Site appears blocked – {_consecutive_timeouts} consecutive "
+            f"timeouts. Stopping to avoid abuse."
+        )
     return None
 
 
@@ -458,56 +481,85 @@ def main():
     total_new = 0
     save_counter = 0
 
-    for year in YEARS:
-        logging.info("── Processing year %d ──", year)
-        days = get_year_calendar(session, year)
-        if not days:
-            logging.info("No report days found for %d, skipping", year)
-            continue
+    # Resume from saved progress – skip years/days already processed
+    progress = load_progress()
+    resume_year = progress.get("year")
+    resume_month = progress.get("month")
+    resume_day = progress.get("day")
+    if resume_year:
+        logging.info("Resuming from progress: %d-%02d-%02d",
+                     resume_year, resume_month, resume_day)
 
-        # Sort by month, then day
-        days.sort(key=lambda x: (x[0], x[1]))
-
-        for month, day, expected_count in days:
-            logging.info("  Day %d-%02d-%02d (expected ~%d reports)",
-                         year, month, day, expected_count)
-
-            reports = get_day_reports(session, year, month, day)
-            if not reports:
-                logging.info("  No reports parsed for %d-%02d-%02d", year, month, day)
+    try:
+        for year in YEARS:
+            # Skip years we've already fully passed
+            if resume_year and year > resume_year:
+                logging.info("── Skipping year %d (already done) ──", year)
                 continue
 
-            logging.info("  Found %d reports for %d-%02d-%02d",
-                         len(reports), year, month, day)
+            logging.info("── Processing year %d ──", year)
+            days = get_year_calendar(session, year)
+            if not days:
+                logging.info("No report days found for %d, skipping", year)
+                continue
 
-            for report in reports:
-                slug = report["url"].rstrip("/").split("/")[-1]
-                if slug in downloaded:
+            # Sort by month, then day
+            days.sort(key=lambda x: (x[0], x[1]))
+
+            for month, day, expected_count in days:
+                # Skip days before our resume point within the resume year
+                if resume_year and year == resume_year:
+                    if (month, day) < (resume_month, resume_day):
+                        continue
+                logging.info("  Day %d-%02d-%02d (expected ~%d reports)",
+                             year, month, day, expected_count)
+
+                reports = get_day_reports(session, year, month, day)
+                if not reports:
+                    logging.info("  No reports parsed for %d-%02d-%02d", year, month, day)
                     continue
 
-                success = download_report(session, report, downloaded)
-                if success:
-                    total_new += 1
-                    save_counter += 1
+                logging.info("  Found %d reports for %d-%02d-%02d",
+                             len(reports), year, month, day)
 
-                    # Periodic state save
-                    if save_counter >= 5:
-                        save_downloaded(downloaded)
-                        save_counter = 0
+                for report in reports:
+                    slug = report["url"].rstrip("/").split("/")[-1]
+                    if slug in downloaded:
+                        continue
 
-                    # Bulk pause
-                    if total_new % BULK_PAUSE_EVERY == 0:
-                        logging.info(
-                            "  Bulk pause after %d new reports (%.0fs)...",
-                            total_new, BULK_PAUSE_SECS,
-                        )
-                        time.sleep(BULK_PAUSE_SECS)
+                    success = download_report(session, report, downloaded)
+                    if success:
+                        total_new += 1
+                        save_counter += 1
 
-            save_progress(year, month, day)
+                        # Periodic state save
+                        if save_counter >= 5:
+                            save_downloaded(downloaded)
+                            save_counter = 0
 
-        # Save state after each year
-        save_downloaded(downloaded)
-        logging.info("Year %d complete. Total new downloads so far: %d", year, total_new)
+                        # Bulk pause
+                        if total_new % BULK_PAUSE_EVERY == 0:
+                            logging.info(
+                                "  Bulk pause after %d new reports (%.0fs)...",
+                                total_new, BULK_PAUSE_SECS,
+                            )
+                            time.sleep(BULK_PAUSE_SECS)
+
+                save_progress(year, month, day)
+
+                # Random longer pause between days to look more human
+                if random.random() < 0.3:
+                    extra = random.uniform(15, 45)
+                    logging.info("  Random day pause (%.0fs)...", extra)
+                    time.sleep(extra)
+
+            # Save state after each year
+            save_downloaded(downloaded)
+            logging.info("Year %d complete. Total new downloads so far: %d", year, total_new)
+
+    except SiteBlockedError as e:
+        logging.error("STOPPED: %s", e)
+        logging.info("Run the scraper again later when the site unblocks.")
 
     save_downloaded(downloaded)
     logging.info("=" * 60)
