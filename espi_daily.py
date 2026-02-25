@@ -41,14 +41,16 @@ DAILY_LOG = os.path.join(STATE_DIR, "daily.log")
 def setup_daily_logging():
     os.makedirs(STATE_DIR, exist_ok=True)
     fmt = "%(asctime)s [%(levelname)s] %(message)s"
-    logging.basicConfig(
-        level=logging.INFO,
-        format=fmt,
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(DAILY_LOG, encoding="utf-8"),
-        ],
-    )
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(logging.INFO)
+    formatter = logging.Formatter(fmt)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(formatter)
+    fh = logging.FileHandler(DAILY_LOG, encoding="utf-8")
+    fh.setFormatter(formatter)
+    root.addHandler(sh)
+    root.addHandler(fh)
 
 
 def acquire_lock():
