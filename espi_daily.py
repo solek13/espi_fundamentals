@@ -12,6 +12,7 @@ import sys
 import time
 import random
 import fcntl
+import argparse
 from datetime import datetime, timedelta
 
 from scrape_espi_periodic import (
@@ -67,6 +68,17 @@ def acquire_lock():
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Daily/backfill ESPI periodic report check")
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=LOOKBACK_DAYS,
+        help=f"Number of days to check backwards from today (default: {LOOKBACK_DAYS})",
+    )
+    parser.add_argument("--start-date", help="Backfill start date YYYY-MM-DD")
+    parser.add_argument("--end-date", help="Backfill end date YYYY-MM-DD")
+    args = parser.parse_args()
+
     setup_daily_logging()
     lock_fp = acquire_lock()
 
@@ -80,10 +92,23 @@ def main():
     session = make_session()
     total_new = 0
     today = datetime.now().date()
+    if args.start_date or args.end_date:
+        if not args.start_date or not args.end_date:
+            parser.error("--start-date and --end-date must be used together")
+        start = datetime.strptime(args.start_date, "%Y-%m-%d").date()
+        end = datetime.strptime(args.end_date, "%Y-%m-%d").date()
+        if end < start:
+            parser.error("--end-date cannot be earlier than --start-date")
+        days_to_check = [
+            start + timedelta(days=i)
+            for i in range((end - start).days + 1)
+        ]
+        logging.info("Date-range mode: %s to %s", start.isoformat(), end.isoformat())
+    else:
+        days_to_check = [today - timedelta(days=offset) for offset in range(args.lookback_days)]
 
     try:
-        for offset in range(LOOKBACK_DAYS):
-            d = today - timedelta(days=offset)
+        for d in days_to_check:
             year, month, day = d.year, d.month, d.day
 
             reports = get_day_reports(session, year, month, day)

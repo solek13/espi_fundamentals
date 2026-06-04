@@ -14,7 +14,8 @@ import sys
 import time
 import random
 import unicodedata
-from datetime import datetime
+import argparse
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -124,6 +125,17 @@ class SiteBlockedError(Exception):
     pass
 
 
+def is_block_page(text: str) -> bool:
+    """Return True when PAP/Incapsula returned an anti-bot page."""
+    lowered = text.lower()
+    return (
+        "_incapsula_resource" in lowered
+        or "request unsuccessful. incapsula incident id" in lowered
+        or "visid_incap" in lowered
+        or "incap_ses" in lowered
+    )
+
+
 # Global counter for consecutive timeouts
 _consecutive_timeouts = 0
 
@@ -139,6 +151,10 @@ def fetch_with_retry(session: requests.Session, url: str,
             time.sleep(random.uniform(*delay_range))
             resp = session.get(url, timeout=60, stream=stream)
             if resp.status_code == 200:
+                if not stream and is_block_page(resp.text):
+                    raise SiteBlockedError(
+                        f"PAP returned an Incapsula block page for {url}"
+                    )
                 _consecutive_timeouts = 0  # reset on success
                 return resp
             if resp.status_code in (429, 500, 502, 503, 504):
@@ -288,13 +304,17 @@ def get_year_calendar(session: requests.Session, year: int) -> list[tuple[int, i
 def get_day_reports(session: requests.Session, year: int, month: int, day: int) -> list[dict]:
     """Fetch AJAX listing for a day, return list of report dicts."""
     url = (f"{BASE_URL}/articles/periodic/{year}/{month}/{day}"
-           f"?limit=100&page=0&company=&selectCompany=")
+           f"?company=&limit=100&page=0&selectCompany=&selectDay=true")
     resp = fetch_with_retry(session, url, delay_range=LISTING_DELAY)
     if not resp:
         return []
 
     # Response may be wrapped in <textarea> tags — strip them
     text = resp.text.strip()
+    if is_block_page(text):
+        raise SiteBlockedError(
+            f"PAP returned an Incapsula block page for day listing {year}-{month:02d}-{day:02d}"
+        )
     if text.startswith("<textarea>"):
         text = text[len("<textarea>"):]
     if text.endswith("</textarea>"):
@@ -303,8 +323,13 @@ def get_day_reports(session: requests.Session, year: int, month: int, day: int) 
     try:
         data = json.loads(text)
     except (json.JSONDecodeError, ValueError):
-        logging.error("Invalid JSON for day listing %d-%02d-%02d", year, month, day)
-        return []
+        logging.error(
+            "Invalid JSON for day listing %d-%02d-%02d. First 200 chars: %r",
+            year, month, day, text[:200]
+        )
+        raise SiteBlockedError(
+            f"Unexpected non-JSON day listing for {year}-{month:02d}-{day:02d}"
+        )
 
     # Extract HTML from Drupal AJAX response
     html = ""
@@ -355,6 +380,62 @@ def get_day_reports(session: requests.Session, year: int, month: int, day: int) 
         })
 
     return reports
+
+
+def iter_dates(start: date, end: date):
+    current = start
+    while current <= end:
+        yield current
+        current += timedelta(days=1)
+
+
+def backfill_date_range(start: date, end: date) -> int:
+    """Download missing reports for a specific date range."""
+    setup_logging()
+    logging.info("=" * 60)
+    logging.info("ESPI Periodic Reports Date Backfill")
+    logging.info("Range: %s to %s", start.isoformat(), end.isoformat())
+    logging.info("=" * 60)
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    downloaded = load_downloaded()
+    logging.info("Previously downloaded: %d reports", len(downloaded))
+
+    session = make_session()
+    total_new = 0
+
+    try:
+        for d in iter_dates(start, end):
+            logging.info("Day %s", d.isoformat())
+            reports = get_day_reports(session, d.year, d.month, d.day)
+            if not reports:
+                logging.info("  No reports parsed for %s", d.isoformat())
+                continue
+
+            new_reports = [
+                r for r in reports
+                if r["url"].rstrip("/").split("/")[-1] not in downloaded
+            ]
+            logging.info(
+                "  Found %d reports, %d new", len(reports), len(new_reports)
+            )
+
+            for report in new_reports:
+                if download_report(session, report, downloaded):
+                    total_new += 1
+                    if total_new % 5 == 0:
+                        save_downloaded(downloaded)
+
+            save_downloaded(downloaded)
+
+    except SiteBlockedError as e:
+        logging.error("STOPPED: %s", e)
+        save_downloaded(downloaded)
+        return 2
+
+    save_downloaded(downloaded)
+    logging.info("Backfill finished. New downloads: %d | Total: %d", total_new, len(downloaded))
+    return 0
 
 
 # ── Individual report download ────────────────────────────────────────────
@@ -467,6 +548,28 @@ def download_report(session: requests.Session, report: dict, downloaded: set) ->
 # ── Main orchestrator ─────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Download ESPI periodic reports from biznes.pap.pl"
+    )
+    parser.add_argument(
+        "--start-date",
+        help="Backfill start date in YYYY-MM-DD format. Requires --end-date.",
+    )
+    parser.add_argument(
+        "--end-date",
+        help="Backfill end date in YYYY-MM-DD format. Requires --start-date.",
+    )
+    args = parser.parse_args()
+
+    if args.start_date or args.end_date:
+        if not args.start_date or not args.end_date:
+            parser.error("--start-date and --end-date must be used together")
+        start = datetime.strptime(args.start_date, "%Y-%m-%d").date()
+        end = datetime.strptime(args.end_date, "%Y-%m-%d").date()
+        if end < start:
+            parser.error("--end-date cannot be earlier than --start-date")
+        raise SystemExit(backfill_date_range(start, end))
+
     setup_logging()
     logging.info("=" * 60)
     logging.info("ESPI Periodic Reports Scraper started")
